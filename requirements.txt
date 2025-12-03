@@ -1,6 +1,5 @@
-fastapi
-uvicorn[standard]
-requests
-pydantic
-pydantic-settings
-pytest
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+pydantic==2.11.0
+pydantic-settings==2.4.0
+requests==2.32.3
