@@ -1,5 +1,3 @@
-# app/api/v1/routes_nfl.py
-
 from typing import Dict, Any, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -47,12 +45,6 @@ async def get_nfl_scoreboard(
         le=3,
     ),
 ):
-    """
-    Devuelve un scoreboard simplificado para una semana:
-    - event_id
-    - matchup
-    - home_team / away_team
-    """
     data = fetch_scoreboard_data(week, season_type)
 
     if not data or "events" not in data or not data["events"]:
@@ -96,7 +88,6 @@ async def get_nfl_scoreboard(
                 )
             )
         except Exception as e:
-            # Si falla un evento, lo saltamos y seguimos con los demás
             print(f"Error parseando evento NFL: {e}")
             continue
 
@@ -113,9 +104,6 @@ async def get_nfl_scoreboard(
 
 @router.get("/odds/{event_id}", response_model=OddsResponse)
 async def get_nfl_odds(event_id: str):
-    """
-    Devuelve las líneas de apuesta (odds) para un Event ID específico.
-    """
     odds_data = fetch_game_odds(event_id)
 
     if not odds_data or "items" not in odds_data or not odds_data["items"]:
@@ -157,31 +145,6 @@ async def get_nfl_odds(event_id: str):
 
 @router.post("/wspm/projection", response_model=WSPMOutput)
 async def wspm_projection(input_data: WSPMInput):
-    """
-    Endpoint del modelo WSPM para NFL (modo manual).
-
-    - Usa base_projection + 4 ajustes (matchup, volumen, riesgo, tempo).
-    - Si model_projection viene en el payload, se usa directamente.
-    - Si NO viene, se calcula:
-
-        wspm_projection = base_projection
-                          + adj_matchup
-                          + adj_volume
-                          + adj_risk
-                          + adj_tempo
-
-    - Calcula:
-        * net_adjust (suma de ponderaciones)
-        * edge vs línea
-        * margen en %
-        * margen de seguridad (abs y %)
-        * probabilidad aproximada de cubrir
-        * dirección (OVER/UNDER)
-        * confianza (Alta / Media-Alta / Media / Baja),
-          donde Alta solo si el margen es > 15% de la línea.
-    """
-
-    # 1) Ajuste neto
     net_adjust = (
         input_data.adj_matchup
         + input_data.adj_volume
@@ -189,16 +152,13 @@ async def wspm_projection(input_data: WSPMInput):
         + input_data.adj_tempo
     )
 
-    # 2) Proyección WSPM
     if input_data.model_projection is not None:
         wspm_projection = input_data.model_projection
     else:
         wspm_projection = input_data.base_projection + net_adjust
 
-    # 3) Edge vs línea
     edge = wspm_projection - input_data.book_line
 
-    # 4) Margen %
     if input_data.book_line != 0:
         margin_pct = (edge / abs(input_data.book_line)) * 100.0
     else:
@@ -207,7 +167,6 @@ async def wspm_projection(input_data: WSPMInput):
     safety_margin_value = abs(edge)
     safety_margin_pct = abs(margin_pct)
 
-    # 5) Probabilidad estimada de cubrir (regla simple)
     abs_m = safety_margin_pct
     if abs_m < 2:
         prob_cover = 52.0
@@ -220,7 +179,6 @@ async def wspm_projection(input_data: WSPMInput):
     else:
         prob_cover = 70.0
 
-    # 6) Dirección y confianza
     direction = "OVER" if edge > 0 else "UNDER"
 
     if safety_margin_pct >= 15:
@@ -263,15 +221,6 @@ async def wspm_projection(input_data: WSPMInput):
 
 @router.post("/wspm/auto-projection", response_model=WSPMOutput)
 async def wspm_auto_projection(payload: WSPMAutoRequest):
-    """
-    WSPM automático:
-    - Usa athlete_id + event_id + season + season_type + week + market_type + book_line.
-    - Obtiene gamelog desde ESPN para calcular base_projection.
-    - Usa odds del partido para ajustar tempo (por total de puntos).
-    - Devuelve la misma estructura que /wspm/projection, pero armada sola.
-    """
-
-    # 1) Scoreboard para validar que el evento exista (y eventualmente usar matchup)
     scoreboard = fetch_scoreboard_data(payload.week, payload.season_type)
     if not scoreboard or "events" not in scoreboard:
         raise HTTPException(
@@ -286,7 +235,6 @@ async def wspm_auto_projection(payload: WSPMAutoRequest):
             detail=f"No se encontró el evento {payload.event_id} en el scoreboard.",
         )
 
-    # 2) Odds para tempo
     odds_data = fetch_game_odds(payload.event_id)
     game_total: Optional[float] = None
     if odds_data and "items" in odds_data and odds_data["items"]:
@@ -297,7 +245,6 @@ async def wspm_auto_projection(payload: WSPMAutoRequest):
         except (TypeError, ValueError):
             game_total = None
 
-    # 3) Gamelog para base_projection
     gamelog = fetch_player_gamelog(
         payload.athlete_id,
         season=payload.season,
@@ -310,7 +257,17 @@ async def wspm_auto_projection(payload: WSPMAutoRequest):
         games_window=5,
     )
 
-    # 4) Ajustes automáticos sencillos (placeholder mejorable)
+    # 👇 Protegemos contra casos donde no hay datos suficientes.
+    if base_projection <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No se pudo calcular una base_projection confiable para este jugador/mercado "
+                "(muy pocos juegos o stats no disponibles). Usa modo manual /wspm/projection "
+                "o ajusta la función compute_base_projection_from_gamelog."
+            ),
+        )
+
     if game_total is not None and game_total >= 50:
         adj_tempo = 3.0
     elif game_total is not None and game_total >= 46:
@@ -389,15 +346,6 @@ async def wspm_auto_projection(payload: WSPMAutoRequest):
 
 @router.post("/wspm/auto-projection-report", response_model=WSPMFullReport)
 async def wspm_auto_projection_report(payload: WSPMAutoRequest):
-    """
-    Versión 'premium' del endpoint WSPM:
-    - Usa datos reales de ESPN (gamelog, odds, scoreboard).
-    - Calcula la proyección WSPM.
-    - Devuelve un reporte completo con breakdown de variables y texto formateado
-      tipo prompt "vendible".
-    """
-
-    # 1) Scoreboard → matchup
     scoreboard = fetch_scoreboard_data(payload.week, payload.season_type)
     if not scoreboard or "events" not in scoreboard:
         raise HTTPException(
@@ -414,7 +362,6 @@ async def wspm_auto_projection_report(payload: WSPMAutoRequest):
 
     matchup = event.get("name", f"{payload.player_team} vs {payload.opponent_team}")
 
-    # 2) Odds → total del partido
     odds_data = fetch_game_odds(payload.event_id)
     game_total: Optional[float] = None
     if odds_data and "items" in odds_data and odds_data["items"]:
@@ -425,7 +372,6 @@ async def wspm_auto_projection_report(payload: WSPMAutoRequest):
         except (TypeError, ValueError):
             game_total = None
 
-    # 3) Gamelog → base_projection
     gamelog = fetch_player_gamelog(
         payload.athlete_id,
         season=payload.season,
@@ -438,7 +384,15 @@ async def wspm_auto_projection_report(payload: WSPMAutoRequest):
         games_window=5,
     )
 
-    # 4) Ajustes WSPM (puedes refinar luego con DVOA/YAC/uso real)
+    if base_projection <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No se pudo calcular una base_projection confiable para este jugador/mercado "
+                "en el reporte. Revisa el gamelog o ajusta la lógica de extracción de stats."
+            ),
+        )
+
     if game_total is not None and game_total >= 50:
         adj_tempo = 3.0
     elif game_total is not None and game_total >= 46:
@@ -614,13 +568,6 @@ async def get_nfl_player_gamelog(
         le=3,
     ),
 ) -> Dict[str, Any]:
-    """
-    Devuelve el gamelog crudo de ESPN para un jugador NFL específico.
-
-    Este endpoint es el primer paso para:
-    - calcular base_projection a partir de los últimos partidos
-    - analizar tendencias recientes (forma, uso, etc.)
-    """
     data = fetch_player_gamelog(athlete_id, season=season, season_type=season_type)
 
     if not data:
@@ -646,11 +593,6 @@ async def get_nfl_games_with_odds(
         le=3,
     ),
 ):
-    """
-    Devuelve una lista de partidos con odds resumidas (ideal para frontend).
-    - Usa el scoreboard para obtener los partidos.
-    - Para cada partido, trae las odds y toma el primer proveedor como referencia.
-    """
     scoreboard = fetch_scoreboard_data(week, season_type)
 
     if not scoreboard or "events" not in scoreboard or not scoreboard["events"]:
@@ -733,25 +675,6 @@ async def get_nfl_games_with_odds(
 
 @router.get("/team/{team_abbr}/roster")
 async def get_team_roster(team_abbr: str) -> Dict[str, Any]:
-    """
-    Devuelve el roster simplificado de un equipo NFL, usando abreviatura ESPN (DAL, KC, PHI, etc.).
-    Estructura:
-
-    {
-      "team_abbr": "DAL",
-      "team_name": "Dallas Cowboys",
-      "players": [
-        {
-          "athlete_id": "3043078",
-          "name": "CeeDee Lamb",
-          "position": "WR",
-          "jersey": "88",
-          "depth": 1
-        },
-        ...
-      ]
-    }
-    """
     roster = fetch_team_roster_by_abbr(team_abbr)
     if not roster:
         raise HTTPException(
@@ -770,19 +693,6 @@ async def get_team_roster(team_abbr: str) -> Dict[str, Any]:
 
 @router.get("/teams", response_model=NFLTeamsResponse)
 async def get_nfl_teams():
-    """
-    Devuelve el catálogo de equipos NFL con:
-    - team_id (ESPN)
-    - abbr (DAL, KC, PHI...)
-    - name (Dallas Cowboys)
-    - location, short_name
-    - logo (URL de ESPN)
-
-    Ideal para que el usuario final:
-    - Vea la lista completa
-    - Construya dropdowns en el frontend
-    - Sepa qué abreviatura usar en otros endpoints (DAL, KC, etc.)
-    """
     teams_data = fetch_nfl_teams_simplified()
 
     if not teams_data:

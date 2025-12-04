@@ -6,8 +6,7 @@ from typing import Any, Dict, List, Optional
 def _extract_stat_from_game(game: Any, stat_names: List[str]) -> Optional[float]:
     """
     Intenta extraer un stat numérico de un "game" del gamelog de ESPN.
-
-    - stat_names: lista de nombres posibles, ej. ["recYds", "yards"].
+    (Lógica original, se mantiene por estructura, pero la función principal usa otra lógica)
     """
     if not isinstance(game, Dict):
         return None
@@ -57,61 +56,75 @@ def compute_base_projection_from_gamelog(
     """
     Calcula una proyección base (media reciente) usando el gamelog real de ESPN.
 
-    - gamelog: JSON devuelto por el endpoint de gamelog de ESPN.
-    - market_type: "receiving_yards", "rushing_yards", "passing_yards".
-    - games_window: cuántos partidos recientes considerar.
-
-    Estrategia:
-    - Buscamos dentro de gamelog["splits"] los partidos individuales.
-    - De cada partido, extraemos el stat relevante (recYds, rushYds, passYds, etc.).
-    - Calculamos la media de los últimos N con valor.
+    CORRECCIÓN: Implementa la lógica de búsqueda por índice ('names' -> 'events'[i]['stats'])
+    para soportar el formato actual de ESPN.
     """
 
     if not gamelog or not isinstance(gamelog, Dict):
         return 0.0
 
-    stat_map = {
-        "receiving_yards": ["recYds", "yards"],
-        "rushing_yards": ["rushYds", "yards"],
-        "passing_yards": ["passYds", "yards"],
+    # 1. Mapeo de market_type a la clave del JSON "names"
+    market_to_name = {
+        "receiving_yards": "receivingYards",
+        "rushing_yards": "rushingYards",
+        "passing_yards": "passingYards",
+        "receptions": "receptions",
+        "rushing_attempts": "rushingAttempts",
     }
 
-    stat_names = stat_map.get(market_type)
-    if not stat_names:
-        # Mercado desconocido: por ahora devolvemos 0.0
+    target_stat_name = market_to_name.get(market_type)
+    if not target_stat_name:
         return 0.0
 
-    splits_root = gamelog.get("splits", {})
-    games: List[Any] = []
-
-    # Intento 1: splits_root["splits"] es directamente la lista de partidos
-    if isinstance(splits_root, Dict):
-        if isinstance(splits_root.get("splits"), list):
-            games = splits_root["splits"]
-        else:
-            # Intento 2: categories -> cada categoría tiene "splits"
-            categories = splits_root.get("categories")
-            if isinstance(categories, list):
-                for cat in categories:
-                    if not isinstance(cat, Dict):
-                        continue
-                    cat_splits = cat.get("splits")
-                    if isinstance(cat_splits, list):
-                        games.extend(cat_splits)
-
-    if not games or not isinstance(games, list):
+    # 2. Encontrar el índice del stat
+    stat_names_list: List[str] = gamelog.get("names", [])
+    try:
+        stat_idx = stat_names_list.index(target_stat_name)
+    except ValueError:
         return 0.0
 
-    # Usamos los últimos N partidos (más recientes)
-    # ESPN suele ordenar cronológicamente, pero para estar seguros invertimos.
-    recent_games = list(reversed(games))[:games_window]
+    # 3. Encontrar los eventos (juegos) de la Temporada Regular
+    regular_season_events: List[Any] = []
+    season_types = gamelog.get("seasonTypes", [])
+
+    for st in season_types:
+        # Busca la Temporada Regular (splitType "2")
+        if st.get("splitType") == "2":
+            categories = st.get("categories", [])
+            for cat in categories:
+                events = cat.get("events")
+                if isinstance(events, list):
+                    regular_season_events.extend(events)
+            break
+
+    if not regular_season_events:
+        return 0.0
+
+    # 4. Extraer los valores de la estadística usando el índice
+    # Se revierte para tomar los más recientes (asumiendo que los eventos se listan cronológicamente)
+    recent_events = list(reversed(regular_season_events))
 
     values: List[float] = []
-    for g in recent_games:
-        val = _extract_stat_from_game(g, stat_names)
-        if val is not None:
-            values.append(val)
+    for event in recent_events:
+        stats_array = event.get("stats", [])
 
+        if len(stats_array) > stat_idx:
+            val_str = stats_array[stat_idx]
+            try:
+                # Se eliminan comas para números grandes (ej. "1,412")
+                val = float(val_str.replace(",", ""))
+
+                # Incluir el valor si es positivo o si la ventana no se ha completado
+                if val > 0.0 or len(values) < games_window:
+                    values.append(val)
+                
+            except (TypeError, ValueError):
+                continue
+
+        if len(values) >= games_window:
+            break
+
+    # 5. Calcular el promedio
     if not values:
         return 0.0
 
