@@ -7,7 +7,7 @@ from app.services.espn_nfl_players_client import fetch_player_gamelog
 from app.services.espn_nfl_roster_client import fetch_team_roster_by_abbr
 from app.services.espn_nfl_teams_client import fetch_nfl_teams_simplified
 from app.services.wspm_nfl_engine import compute_base_projection_from_gamelog
-
+from app.services.nfl_game_projection import compute_game_projection
 from app.schemas.nfl import (
     ScoreboardResponse,
     ScoreboardEvent,
@@ -23,6 +23,9 @@ from app.schemas.nfl import (
     NFLTeamsResponse,
     WSPMFullReport,
     WSPMVariableBreakdown,
+    GameProjectionInput,
+    GameProjectionOutput,
+    GameProjectionReport,
 )
 
 router = APIRouter(
@@ -704,4 +707,135 @@ async def get_nfl_teams():
     return NFLTeamsResponse(
         count=len(teams_data),
         teams=teams_data,
+    )
+# ---------------------------------------------------------------------------
+# 10) PROYECCIÓN DE PARTIDO (TOTAL + SPREAD) NUMÉRICA
+# ---------------------------------------------------------------------------
+
+@router.post("/game-projection", response_model=GameProjectionOutput)
+async def nfl_game_projection(input_data: GameProjectionInput):
+    """
+    Modelo de partido NFL:
+    - Proyecta total de puntos y spread (home - away)
+    - Usa medias recientes de puntos anotados / permitidos
+    - Compara vs líneas del book (total y spread)
+    """
+    try:
+        result = compute_game_projection(
+            event_id=input_data.event_id,
+            week=input_data.week,
+            season_type=input_data.season_type,
+            book_total=input_data.book_total,
+            book_spread=input_data.book_spread,
+            games_window=input_data.games_window,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    # mapeamos dict -> Pydantic
+    return GameProjectionOutput(
+        event_id=result["event_id"],
+        matchup=result["matchup"],
+        home_team=result["home_team"],
+        away_team=result["away_team"],
+        book_total=result["book_total"],
+        book_spread=result["book_spread"],
+        implied_home_total=result["implied_home_total"],
+        implied_away_total=result["implied_away_total"],
+        model_home_total=result["model_home_total"],
+        model_away_total=result["model_away_total"],
+        model_total=result["model_total"],
+        model_spread=result["model_spread"],
+        edge_total=result["edge_total"],
+        edge_spread=result["edge_spread"],
+        margin_total_pct=result["margin_total_pct"],
+        margin_spread_pct=result["margin_spread_pct"],
+        safety_total=result["safety_total"],
+        safety_total_pct=result["safety_total_pct"],
+        safety_spread=result["safety_spread"],
+        safety_spread_pct=result["safety_spread_pct"],
+        prob_total=result["prob_total"],
+        prob_spread=result["prob_spread"],
+        direction_total=result["direction_total"],
+        side_spread=result["side_spread"],
+        confidence_total=result["confidence_total"],
+        confidence_spread=result["confidence_spread"],
+        games_window=result["games_window"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 11) PROYECCIÓN DE PARTIDO (REPORTE MARKDOWN "VENDIBLE")
+# ---------------------------------------------------------------------------
+
+@router.post("/game-projection-report", response_model=GameProjectionReport)
+async def nfl_game_projection_report(input_data: GameProjectionInput):
+    """
+    Igual que /game-projection pero devuelve un reporte markdown listo
+    para mostrar / enviar.
+    """
+    try:
+        result = compute_game_projection(
+            event_id=input_data.event_id,
+            week=input_data.week,
+            season_type=input_data.season_type,
+            book_total=input_data.book_total,
+            book_spread=input_data.book_spread,
+            games_window=input_data.games_window,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    ht = result["home_team"]
+    at = result["away_team"]
+
+    markdown_report = f"""### 🏈 Proyección de Partido (Modelo WSPM – Totales & Spread)
+
+*Partido:* {result['matchup']}
+*Equipos:* {at['abbr']} @ {ht['abbr']}
+
+#### 📊 Líneas del Book
+
+- **Total:** {result['book_total']:.1f} pts  
+- **Spread:** {result['book_spread']:+.1f} (perspectiva LOCAL)
+
+Implied totals del book:
+- Local: **{result['implied_home_total']:.1f}** pts  
+- Visitante: **{result['implied_away_total']:.1f}** pts  
+
+#### 🔮 Proyección del Modelo
+
+- Total proyectado: **{result['model_total']:.1f}** pts  
+- Spread proyectado: **{result['model_spread']:+.1f}** (home - away)  
+
+Desglose por equipo:
+- Local ({ht['abbr']}): **{result['model_home_total']:.1f}** pts  
+- Visitante ({at['abbr']}): **{result['model_away_total']:.1f}** pts  
+
+#### 📐 Valor vs Book
+
+**Total (O/U):**
+- Edge: **{result['edge_total']:+.1f}** pts ({result['margin_total_pct']:.1f}%)  
+- Dirección modelo: **{result['direction_total']}**  
+- Margen de seguridad: **{result['safety_total']:.1f}** pts  
+- Probabilidad estimada de acierto: **{result['prob_total']:.1f}%**  
+- Confianza: **{result['confidence_total']}**
+
+**Spread:**
+- Edge: **{result['edge_spread']:+.1f}** pts ({result['margin_spread_pct']:.1f}%)  
+- Lado con valor: **{result['side_spread']}**  
+- Margen de seguridad: **{result['safety_spread']:.1f}** pts  
+- Probabilidad estimada de acierto: **{result['prob_spread']:.1f}%**  
+- Confianza: **{result['confidence_spread']}**
+
+_Resumen rápido_:  
+- **Total WSPM:** {result['direction_total']} {result['book_total']:.1f}  
+- **Spread WSPM:** {result['side_spread']} (vs {result['book_spread']:+.1f})
+"""
+
+    return GameProjectionReport(
+        **result,
+        home_team=ht,
+        away_team=at,
+        markdown_report=markdown_report,
     )

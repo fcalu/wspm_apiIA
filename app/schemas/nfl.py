@@ -219,3 +219,57 @@ class WSPMFullReport(BaseModel):
 
     # Reporte ya formateado tipo prompt que quieres vender
     markdown_report: str
+# ======================================================================
+#  GAME LEVEL – PROYECCIÓN DE TOTAL Y SPREAD
+# ======================================================================
+
+class GameProjectionInput(BaseModel):
+    event_id: str
+    week: int
+    season_type: int = 2  # 1=Pre, 2=Regular, 3=Post
+    book_total: float
+    book_spread: float  # spread desde perspectiva del LOCAL (positivo = local favorito)
+    games_window: int = 5
+
+
+class GameProjectionOutput(BaseModel):
+    event_id: str
+    matchup: str
+    home_team: TeamInfo
+    away_team: TeamInfo
+
+    book_total: float
+    book_spread: float
+
+    implied_home_total: float
+    implied_away_total: float
+
+    model_home_total: float
+    model_away_total: float
+    model_total: float
+    model_spread: float
+
+    edge_total: float
+    edge_spread: float
+    margin_total_pct: float
+    margin_spread_pct: float
+
+    safety_total: float
+    safety_total_pct: float
+    safety_spread: float
+    safety_spread_pct: float
+
+    prob_total: float
+    prob_spread: float
+
+    direction_total: str      # OVER / UNDER
+    side_spread: str          # HOME / AWAY
+
+    confidence_total: str     # Alta / Media-Alta / ...
+    confidence_spread: str
+
+    games_window: int
+
+
+class GameProjectionReport(GameProjectionOutput):
+    markdown_report: str
