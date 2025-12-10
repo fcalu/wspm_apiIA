@@ -54,7 +54,8 @@ def fetch_game_odds(event_id: str, use_cache: bool = True) -> Optional[Dict[str,
             logger.info(f"[ESPN][NFL] Cache HIT para {cache_key}")
             return cached
 
-    url = f"{BASE_URL_CORE}/events/{event_id}/competitions/{event_id}/odds"
+    # 💡 CORRECCIÓN APLICADA: La URL se simplifica quitando /competitions/{event_id}
+    url = f"{BASE_URL_CORE}/events/{event_id}/odds"
     logger.info(f"[ESPN][NFL] Fetch odds desde URL: {url}")
 
     try:
