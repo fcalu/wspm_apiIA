@@ -1,4 +1,6 @@
+import re # 💡 IMPORTANTE: Añadido para el parsing del Spread
 from typing import Dict, Any, List, Optional
+from pydantic import BaseModel # 💡 Añadido para el nuevo esquema de salida simple
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -32,6 +34,12 @@ router = APIRouter(
     prefix="/nfl",
     tags=["nfl"],
 )
+
+# 💡 Nuevo esquema simple que el script cliente espera
+class SimpleOddsOutput(BaseModel):
+    event_id: str
+    spread: float
+    total: float
 
 
 # ---------------------------------------------------------------------------
@@ -102,44 +110,60 @@ async def get_nfl_scoreboard(
 
 
 # ---------------------------------------------------------------------------
-# 2) ODDS POR PARTIDO
+# 2) ODDS POR PARTIDO (CORRECCIÓN CLAVE DE PARSING)
 # ---------------------------------------------------------------------------
 
-@router.get("/odds/{event_id}", response_model=OddsResponse)
+@router.get("/odds/{event_id}", response_model=SimpleOddsOutput) # 💡 Usamos el esquema de salida simple
 async def get_nfl_odds(event_id: str):
     odds_data = fetch_game_odds(event_id)
 
     if not odds_data or "items" not in odds_data or not odds_data["items"]:
+        # El cliente recibirá el error 404, que es manejado por el script externo
         raise HTTPException(
             status_code=404,
             detail="No se encontraron odds para ese Event ID.",
         )
 
-    books_out: List[OddsBook] = []
+    # 1. Extraer los datos del primer bookmaker (se asume que es el principal)
+    first_item = odds_data["items"][0]
+    details = first_item.get("details")  # Spread como texto (ej: "SEA -1.5")
+    ou_raw = first_item.get("overUnder")  # Total (ej: 47.5)
 
-    for item in odds_data["items"]:
-        provider = item.get("provider", {}).get("name", "N/A")
-        details = item.get("details", "N/A")
-        ou_raw = item.get("overUnder")
+    book_total = None
+    book_spread = None
 
-        try:
-            over_under = float(ou_raw) if ou_raw is not None else None
-        except (TypeError, ValueError):
-            over_under = None
+    try:
+        # A. Parsear Total (Over/Under)
+        if ou_raw is not None:
+            book_total = float(ou_raw)
 
-        books_out.append(
-            OddsBook(
-                provider=provider,
-                details=details,
-                over_under=over_under,
-            )
+        # B. Parsear Spread numérico de la cadena 'details'
+        if details and isinstance(details, str):
+            # Regex: busca el número (con o sin signo) al final del string (ej: -1.5)
+            spread_match = re.search(r"([+-]?\d+\.?\d*)$", details)
+            if spread_match:
+                book_spread = float(spread_match.group(1))
+
+    except Exception:
+        # Si falla el float() o el regex, lanza error al cliente
+        raise HTTPException(
+            status_code=500,
+            detail="Error interno al extraer Spread o Total numérico del JSON de ESPN.",
         )
 
-    return OddsResponse(
-        event_id=event_id,
-        books=books_out,
-        raw_count=len(books_out),
-    )
+    if book_total is None or book_spread is None:
+         # El error que el cliente espera para saltar el juego
+         raise HTTPException(
+            status_code=404,
+            detail="No se encontraron las líneas Spread y Total numéricas válidas.",
+        )
+
+    # 💡 Devolvemos el formato plano que el script cliente espera
+    return {
+        "event_id": event_id,
+        "spread": book_spread,
+        "total": book_total
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -500,17 +524,13 @@ async def wspm_auto_projection_report(payload: WSPMAutoRequest):
 
 #### ⚖️ Ponderación de Variables Clave (vs Línea Base):
 
-* **Variable 1: Matchup Defensivo Avanzado (DVOA/YAC)**  
-  - *Ponderación:* {adj_matchup:+.1f} unidades
+* **Variable 1: Matchup Defensivo Avanzado (DVOA/YAC)** - *Ponderación:* {adj_matchup:+.1f} unidades
 
-* **Variable 2: Volumen de Juego Proyectado (Targets/Carries/Pases)**  
-  - *Ponderación:* {adj_volume:+.1f} unidades
+* **Variable 2: Volumen de Juego Proyectado (Targets/Carries/Pases)** - *Ponderación:* {adj_volume:+.1f} unidades
 
-* **Variable 3: Riesgo/Reversión de Margen**  
-  - *Ponderación:* {adj_risk:+.1f} unidades
+* **Variable 3: Riesgo/Reversión de Margen** - *Ponderación:* {adj_risk:+.1f} unidades
 
-* **Variable 4: Game Flow (Ritmo Proyectado/Tempo)**  
-  - *Ponderación:* {adj_tempo:+.1f} unidades
+* **Variable 4: Game Flow (Ritmo Proyectado/Tempo)** - *Ponderación:* {adj_tempo:+.1f} unidades
 
 #### 🎯 Análisis y Justificación:
 
@@ -523,8 +543,7 @@ El margen de seguridad respecto a la línea del book es de **{margen_seguridad_s
 
 #### 💡 Conclusión:
 
-*Dirección Esperada (Valor WSPM):* **{direction}**  
-*Confianza del Pick (Rigurosa):* **{confidence}**
+*Dirección Esperada (Valor WSPM):* **{direction}** *Confianza del Pick (Rigurosa):* **{confidence}**
 """
 
     return WSPMFullReport(
@@ -816,17 +835,13 @@ Desglose por equipo:
 
 **Total (O/U):**
 - Edge: **{result['edge_total']:+.1f}** pts ({result['margin_total_pct']:.1f}%)  
-- Dirección modelo: **{result['direction_total']}**  
-- Margen de seguridad: **{result['safety_total']:.1f}** pts  
-- Probabilidad estimada de acierto: **{result['prob_total']:.1f}%**  
-- Confianza: **{result['confidence_total']}**
+- Dirección modelo: **{result['direction_total']}** - Margen de seguridad: **{result['safety_total']:.1f}** pts  
+- Probabilidad estimada de acierto: **{result['prob_total']:.1f}%** - Confianza: **{result['confidence_total']}**
 
 **Spread:**
 - Edge: **{result['edge_spread']:+.1f}** pts ({result['margin_spread_pct']:.1f}%)  
-- Lado con valor: **{result['side_spread']}**  
-- Margen de seguridad: **{result['safety_spread']:.1f}** pts  
-- Probabilidad estimada de acierto: **{result['prob_spread']:.1f}%**  
-- Confianza: **{result['confidence_spread']}**
+- Lado con valor: **{result['side_spread']}** - Margen de seguridad: **{result['safety_spread']:.1f}** pts  
+- Probabilidad estimada de acierto: **{result['prob_spread']:.1f}%** - Confianza: **{result['confidence_spread']}**
 
 _Resumen rápido_:  
 - **Total WSPM:** {result['direction_total']} {result['book_total']:.1f}  
