@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Query
 from app.services.espn_nba_client import (
     fetch_nba_scoreboard,
     fetch_nba_game_odds,
+    fetch_nba_team_with_roster,
 )
 from app.services.espn_nba_players_client import fetch_nba_player_gamelog
 from app.services.espn_nba_roster_client import fetch_nba_team_roster_by_abbr
@@ -140,22 +141,120 @@ async def get_nba_games_with_odds(
 @router.get("/team/{team_abbr}/roster")
 async def get_nba_team_roster(team_abbr: str) -> Dict[str, Any]:
     """
-    Devuelve roster simplificado de un equipo NBA por abreviatura ESPN:
-    LAL, BOS, GS, MIA, etc.
-    """
-    team_abbr = team_abbr.strip().upper()
+    Devuelve el roster NBA de un equipo (abreviatura, ej: LAL, BOS, DAL).
 
-    roster = fetch_nba_team_roster_by_abbr(team_abbr)
-    if not roster:
+    Respuesta:
+    {
+      "team_abbr": "LAL",
+      "team_name": "Los Angeles Lakers",
+      "players": [
+        {
+          "athlete_id": "3032977",
+          "name": "LeBron James",
+          "position": "SF",
+          "jersey": "23",
+          "depth": null,
+          "team_abbr": "LAL"
+        },
+        ...
+      ]
+    }
+    """
+    team_abbr = team_abbr.upper()
+
+    data = fetch_nba_team_with_roster(team_abbr)
+    if not data:
         raise HTTPException(
             status_code=502,
-            detail=(
-                f"No se pudo obtener el roster para {team_abbr}. "
-                "Verifica abreviatura soportada por ESPN."
-            ),
+            detail=f"No se pudo obtener información de roster para {team_abbr}.",
         )
-    return roster
 
+    # ESPN suele envolver en "team"
+    team = data.get("team") or data
+    team_name = (
+        team.get("displayName")
+        or team.get("name")
+        or team.get("location")
+        or team_abbr
+    )
+
+    # ------------------------------------------------------------------
+    # Diferentes estructuras posibles de roster:
+    #
+    # 1) team["roster"]["entries"] -> cada entry tiene "player" o "athlete"
+    # 2) team["athletes"] -> lista directa de atletas
+    # 3) team["roster"]["athletes"] -> también se ve a veces
+    # ------------------------------------------------------------------
+    roster_obj = (
+        team.get("roster")
+        or team.get("athletes")
+        or data.get("roster")
+    )
+
+    entries: List[Dict[str, Any]] = []
+
+    if isinstance(roster_obj, dict):
+        entries = (
+            roster_obj.get("entries")
+            or roster_obj.get("athletes")
+            or roster_obj.get("items")
+            or []
+        )
+    elif isinstance(roster_obj, list):
+        entries = roster_obj
+    else:
+        entries = []
+
+    players_out: List[Dict[str, Any]] = []
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        # Intentar distintos nombres
+        p = (
+            entry.get("player")
+            or entry.get("athlete")
+            or entry.get("athlete", {})
+        )
+
+        # En algunos casos el propio entry ya es el jugador
+        if not p and "id" in entry:
+            p = entry
+
+        if not isinstance(p, dict):
+            continue
+
+        athlete_id = p.get("id")
+        name = (
+            p.get("fullName")
+            or p.get("displayName")
+            or p.get("shortName")
+        )
+        pos_info = p.get("position") or {}
+        position = (
+            pos_info.get("abbreviation")
+            or pos_info.get("displayName")
+            or pos_info.get("name")
+        )
+        jersey = p.get("jersey")
+
+        players_out.append(
+            {
+                "athlete_id": str(athlete_id) if athlete_id else None,
+                "name": name,
+                "position": position,
+                "jersey": jersey,
+                "depth": entry.get("status") or entry.get("depth") or None,
+                "team_abbr": team_abbr,
+            }
+        )
+
+    return {
+        "team_abbr": team_abbr,
+        "team_name": team_name,
+        "players": players_out,
+    }
 
 # -----------------------------------------------------------------------------
 # 3) GAMELOG CRUDO DE JUGADOR NBA
