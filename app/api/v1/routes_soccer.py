@@ -1,7 +1,7 @@
 # app/api/v1/routes_soccer.py
 
 from typing import Any, Dict, List, Optional
-from math import exp
+from math import exp, factorial
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
@@ -24,7 +24,7 @@ router = APIRouter(
 )
 
 # =========================================================
-# Modelos para proyección de partido
+# Modelos Pydantic para proyección de partido
 # =========================================================
 
 
@@ -35,7 +35,7 @@ class SoccerGameProjectionRequest(BaseModel):
     Flujo típico:
       1) Llamas a /soccer/games-with-odds?league=laliga
       2) Tomas un event_id de la respuesta
-      3) Llamas a /soccer/game-projection con ese event_id y la misma liga
+      3) Llamas a /soccer/game-projection con ese event_id
     """
     event_id: str
     league: Optional[str] = None
@@ -46,7 +46,7 @@ class SoccerMarketProjection(BaseModel):
     pick: str                 # ej: "OVER 2.5", "1", "X", "2", "1X", "X2", "12", "NO BET"
     confidence: str           # "Alta" | "Media-Alta" | "Media" | "Baja"
     prob: float               # probabilidad estimada (0-1)
-    edge_pct: Optional[float] = None  # opcional, solo se usa en Over 2.5
+    edge_pct: Optional[float] = None
     note: Optional[str] = None
 
 
@@ -61,42 +61,40 @@ class SoccerGameProjection(BaseModel):
     # Línea del book (total goles) si existe
     book_over_under: Optional[float]
 
-    # Modelo interno
+    # Intensidades de gol (modelo de Poisson Bayes)
+    lambda_home: float
+    lambda_away: float
     expected_goals: float
-    prob_over25: float
+
+    # Probabilidades Poisson totales
+    prob_over25_poisson: float
 
     # Probabilidades 1X2
     prob_1: float
     prob_X: float
     prob_2: float
 
-    # Picks de alto nivel
+    # Picks
     over25_pick: SoccerMarketProjection
     pick_1x2: SoccerMarketProjection
     double_chance_best: SoccerMarketProjection
 
 
 # =========================================================
-# Helpers internos (modelo heurístico simple)
+# Helpers: Bayes + Poisson + ajuste tipo "IA"
 # =========================================================
 
-
-def _confidence_from_prob(p: float) -> str:
-    if p >= 0.70:
-        return "Alta"
-    elif p >= 0.60:
-        return "Media-Alta"
-    elif p >= 0.55:
-        return "Media"
-    else:
-        return "Baja"
+def _poisson_pmf(k: int, lam: float) -> float:
+    """P(k; λ) clásico de Poisson."""
+    if k < 0:
+        return 0.0
+    return exp(-lam) * (lam ** k) / factorial(k)
 
 
-def _parse_points_per_game(competitor: Dict[str, Any]) -> float:
+def _extract_record_data(competitor: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Intenta estimar fuerza del equipo a partir de su record tipo '10-5-3'.
-
-    Retorna puntos por partido en escala 0..1 aprox.
+    Extrae W-D-L y puntos/partido de summaries tipo '10-5-3'.
+    Devuelve dict con: w, d, l, games, ppg.
     """
     records = competitor.get("records", [])
     summary_str = None
@@ -109,90 +107,204 @@ def _parse_points_per_game(competitor: Dict[str, Any]) -> float:
                 break
 
     if not summary_str or not isinstance(summary_str, str):
-        # fallback neutro
-        return 0.5
+        return {"w": 0, "d": 0, "l": 0, "games": 0, "ppg": 0.5}
 
     try:
         parts = summary_str.replace(" ", "").split("-")
         if len(parts) < 2:
-            return 0.5
+            return {"w": 0, "d": 0, "l": 0, "games": 0, "ppg": 0.5}
+
         w = int(parts[0])
         l = int(parts[1])
         d = int(parts[2]) if len(parts) >= 3 else 0
         games = w + l + d
         if games <= 0:
-            return 0.5
+            return {"w": 0, "d": 0, "l": 0, "games": 0, "ppg": 0.5}
 
         pts = 3 * w + d
-        ppg = pts / (3.0 * games)  # 0..1
-        return max(0.2, min(0.95, ppg))
+        ppg = pts / (3.0 * games)  # escala 0..1 aprox
+        ppg = max(0.2, min(0.95, ppg))
+        return {"w": w, "d": d, "l": l, "games": games, "ppg": ppg}
     except Exception:
-        return 0.5
+        return {"w": 0, "d": 0, "l": 0, "games": 0, "ppg": 0.5}
 
 
-def _compute_1x2_probs(home_comp: Dict[str, Any], away_comp: Dict[str, Any]) -> Dict[str, float]:
-    """
-    Genera probabilidades 1X2 en base a 'fuerza' de equipos + pequeña ventaja local.
-    """
-    home_strength = _parse_points_per_game(home_comp)
-    away_strength = _parse_points_per_game(away_comp)
-
-    # ventaja local moderada
-    home_strength += 0.05
-    delta = home_strength - away_strength  # positivo => local favorito
-
-    # logistic around 0.5
-    scale = 3.0
-    p_home_raw = 1.0 / (1.0 + exp(-scale * delta))  # 0..1
-    p_away_raw = 1.0 - p_home_raw
-
-    # prob de empate base, ajustada por lo cerrado del partido
-    draw_raw = max(0.15, 0.30 - 0.10 * abs(delta))
-
-    remaining = 1.0 - draw_raw
-    p_home = p_home_raw * remaining
-    p_away = p_away_raw * remaining
-
-    # normalizamos a 1
-    s = p_home + draw_raw + p_away
-    p_home /= s
-    draw = draw_raw / s
-    p_away /= s
-
-    return {
-        "1": p_home,
-        "X": draw,
-        "2": p_away,
-    }
+def _confidence_from_prob(p: float) -> str:
+    """Escala de confianza basada en probabilidad."""
+    if p >= 0.70:
+        return "Alta"
+    elif p >= 0.60:
+        return "Media-Alta"
+    elif p >= 0.55:
+        return "Media"
+    else:
+        return "Baja"
 
 
-def _compute_expected_goals(
+def _compute_bayesian_lambdas(
     book_over_under: Optional[float],
     home_comp: Dict[str, Any],
     away_comp: Dict[str, Any],
+) -> Dict[str, float]:
+    """
+    Modelo Bayes + Poisson para intensidades de gol de cada equipo.
+
+    - Prior de liga: total goles promedio ~ 2.6 (ajustable)
+    - Si hay línea de OU del book, usamos eso como prior de total (market wisdom).
+    - PPG de cada equipo (a partir de W-D-L) modula ataque/defensa.
+    - Shrinkage Bayesiano contra el prior según nº de partidos.
+    """
+    # Prior de liga
+    league_total_prior = 2.6
+
+    if book_over_under is not None and book_over_under > 0:
+        total_prior = 0.7 * book_over_under + 0.3 * league_total_prior
+    else:
+        total_prior = league_total_prior
+
+    # Dividimos prior en home/away con ligera ventaja local
+    prior_lambda_home = total_prior * 0.55
+    prior_lambda_away = total_prior * 0.45
+
+    home_stats = _extract_record_data(home_comp)
+    away_stats = _extract_record_data(away_comp)
+
+    h_ppg = home_stats["ppg"]
+    a_ppg = away_stats["ppg"]
+    h_games = home_stats["games"]
+    a_games = away_stats["games"]
+
+    # Centro en 0 (0 = equipo medio de liga)
+    h_strength = h_ppg - 0.5
+    a_strength = a_ppg - 0.5
+
+    # Modelo lineal de ataque crudo (antes de Bayes):
+    base_each = total_prior / 2.0
+
+    # El home se beneficia más de su propia fuerza y castiga la del rival
+    lambda_home_raw = base_each * (
+        1.0
+        + 0.9 * h_strength   # ataque local
+        - 0.5 * a_strength   # defensa rival
+        + 0.08               # ventaja local fija
+    )
+
+    lambda_away_raw = base_each * (
+        1.0
+        + 0.9 * a_strength
+        - 0.5 * h_strength
+        - 0.02               # pequeño castigo visitante
+    )
+
+    lambda_home_raw = max(0.2, lambda_home_raw)
+    lambda_away_raw = max(0.2, lambda_away_raw)
+
+    # Shrinkage Bayesiano contra el prior
+    prior_weight = 5.0  # "equivalente" a 5 partidos
+
+    lambda_home_post = (
+        lambda_home_raw * h_games + prior_lambda_home * prior_weight
+    ) / max(h_games + prior_weight, 1.0)
+
+    lambda_away_post = (
+        lambda_away_raw * a_games + prior_lambda_away * prior_weight
+    ) / max(a_games + prior_weight, 1.0)
+
+    lambda_home_post = max(0.2, min(3.8, lambda_home_post))
+    lambda_away_post = max(0.2, min(3.8, lambda_away_post))
+
+    return {
+        "lambda_home": lambda_home_post,
+        "lambda_away": lambda_away_post,
+    }
+
+
+def _poisson_score_matrix(lambda_home: float, lambda_away: float, max_goals: int = 10):
+    """
+    Construye matrices Poisson para goles de home y away, y devuelve:
+      - pmf_home[k]
+      - pmf_away[k]
+      - P(total=g) hasta g=max_goals*2 (con último bucket como cola)
+      - P(home>away), P(empate), P(away>home)
+    """
+    pmf_home = [0.0] * (max_goals + 1)
+    pmf_away = [0.0] * (max_goals + 1)
+
+    for k in range(max_goals):
+        pmf_home[k] = _poisson_pmf(k, lambda_home)
+        pmf_away[k] = _poisson_pmf(k, lambda_away)
+
+    # añadimos cola al último bucket para no perder probabilidad
+    pmf_home[max_goals] = max(0.0, 1.0 - sum(pmf_home[:-1]))
+    pmf_away[max_goals] = max(0.0, 1.0 - sum(pmf_away[:-1]))
+
+    # matriz conjunta y totales
+    max_total = max_goals * 2
+    p_total = [0.0] * (max_total + 1)
+    p_home_win = 0.0
+    p_draw = 0.0
+    p_away_win = 0.0
+
+    for i in range(max_goals + 1):
+        for j in range(max_goals + 1):
+            p_ij = pmf_home[i] * pmf_away[j]
+            total = i + j
+            if total > max_total:
+                total = max_total
+            p_total[total] += p_ij
+
+            if i > j:
+                p_home_win += p_ij
+            elif i == j:
+                p_draw += p_ij
+            else:
+                p_away_win += p_ij
+
+    # normalización ligera por redondeos
+    s1x2 = p_home_win + p_draw + p_away_win
+    if s1x2 > 0:
+        p_home_win /= s1x2
+        p_draw /= s1x2
+        p_away_win /= s1x2
+
+    return {
+        "p_total": p_total,
+        "p_home_win": p_home_win,
+        "p_draw": p_draw,
+        "p_away_win": p_away_win,
+    }
+
+
+def _ai_adjust_over25_prob(
+    prob_poisson_over25: float,
+    lambda_home: float,
+    lambda_away: float,
+    book_over_under: Optional[float],
 ) -> float:
     """
-    Estimación muy simple de goles esperados:
-      - se parte de la línea del book si existe
-      - se ajusta un poco según la diferencia de 'fuerza'
+    Capa tipo 'IA': logistic que ajusta la probabilidad de Over 2.5 combinando
+    Poisson con señales sencillas (intensidad total vs línea del book).
+
+    No es una red entrenada, pero imita una corrección de modelo:
+      prob_final = 0.7 * prob_poisson + 0.3 * prob_logistic
     """
-    base = book_over_under if book_over_under is not None else 2.5
+    total_lambda = lambda_home + lambda_away
+    thresh = book_over_under if book_over_under is not None else 2.5
 
-    home_strength = _parse_points_per_game(home_comp)
-    away_strength = _parse_points_per_game(away_comp)
-    delta = home_strength - away_strength
+    # Feature: cuánto se separa la intensidad total de la línea clave (2.5 o la del book)
+    delta = total_lambda - thresh
 
-    # partidos desbalanceados suelen tener más goles
-    adjust = 0.6 * abs(delta)  # 0..~0.45
+    # Logistic centrada en delta=0
+    k = 1.6
+    prob_logistic = 1.0 / (1.0 + exp(-k * delta))
 
-    expected = base + adjust
-    return max(1.5, min(4.5, expected))
+    prob_final = 0.7 * prob_poisson_over25 + 0.3 * prob_logistic
+    return max(0.0, min(1.0, prob_final))
 
 
 # =========================================================
-# 1) Listar torneos
-# ==========================================================
-
+# 1) Listar torneos configurados
+# =========================================================
 
 @router.get("/tournaments")
 async def list_soccer_tournaments() -> Dict[str, Any]:
@@ -217,8 +329,7 @@ async def list_soccer_tournaments() -> Dict[str, Any]:
 
 # =========================================================
 # 2) Juegos con odds por torneo
-# ==========================================================
-
+# =========================================================
 
 @router.get("/games-with-odds", response_model=GamesWithOddsResponse)
 async def get_soccer_games_with_odds(
@@ -317,19 +428,22 @@ async def get_soccer_games_with_odds(
 
 
 # =========================================================
-# 3) Proyección de partido (Over 2.5, 1X2, Doble Oportunidad)
-# ==========================================================
+# 3) Proyección de partido: Bayes + Poisson + "IA"
+# =========================================================
+
 @router.post("/game-projection", response_model=SoccerGameProjection)
 async def soccer_game_projection(payload: SoccerGameProjectionRequest):
     """
-    Proyección simple para:
-      - Mercado Over 2.5 goles
-      - Mercado 1X2
-      - Doble oportunidad (1X, X2, 12)
+    Proyección cuantitativa para un partido de soccer:
 
-    Usa:
-      - event_id del partido
-      - la liga (alias o código). Si no se manda, se usa la liga por defecto.
+      - Mercado Over 2.5 goles (probabilidad + edge vs la línea)
+      - Mercado 1X2 (probabilidades y pick)
+      - Doble oportunidad (1X, X2, 12) usando las probs 1X2
+
+    El modelo combina:
+      • Shrinkage Bayesiano contra el promedio de liga y línea del book.
+      • Modelo de goles Poisson (matriz de resultados).
+      • Ajuste tipo 'IA' (logistic) para calibrar Over 2.5.
     """
     league = payload.league
 
@@ -392,22 +506,37 @@ async def soccer_game_projection(payload: SoccerGameProjectionRequest):
         except (TypeError, ValueError):
             book_over_under = None
 
-    # ============================
-    # Modelo de goles / Over 2.5
-    # ============================
-    expected_goals = _compute_expected_goals(
+    # 1) Intensidades de gol λ_home, λ_away (Bayes + prior de liga + OU)
+    lambdas = _compute_bayesian_lambdas(
         book_over_under=book_over_under,
         home_comp=home_comp_raw,
         away_comp=away_comp_raw,
     )
+    lambda_home = lambdas["lambda_home"]
+    lambda_away = lambdas["lambda_away"]
+    expected_goals = lambda_home + lambda_away
 
-    # probabilidad "suave" de Over 2.5
-    line_25 = 2.5
-    k = 1.1
-    prob_over25 = 1.0 / (1.0 + exp(-k * (expected_goals - line_25)))
+    # 2) Matriz Poisson para totales y 1X2
+    mat = _poisson_score_matrix(lambda_home, lambda_away, max_goals=10)
+    p_total = mat["p_total"]
+    p_home_win = mat["p_home_win"]
+    p_draw = mat["p_draw"]
+    p_away_win = mat["p_away_win"]
 
-    # edge aproximado vs 2.5
-    edge_over25_pct = ((expected_goals - line_25) / max(line_25, 1.0)) * 100.0
+    # Probabilidad Poisson de Over 2.5 (goles >= 3)
+    prob_over25_poisson = sum(p_total[g] for g in range(3, len(p_total)))
+
+    # 3) Ajuste tipo "IA" para Over 2.5
+    prob_over25 = _ai_adjust_over25_prob(
+        prob_poisson_over25=prob_over25_poisson,
+        lambda_home=lambda_home,
+        lambda_away=lambda_away,
+        book_over_under=book_over_under,
+    )
+
+    # Edge vs línea 2.5 (o la del book si la tienes)
+    thresh = book_over_under if book_over_under is not None else 2.5
+    edge_pct = ((expected_goals - thresh) / max(thresh, 1.0)) * 100.0
 
     if prob_over25 >= 0.55:
         over25_pick_label = "OVER 2.5"
@@ -421,22 +550,15 @@ async def soccer_game_projection(payload: SoccerGameProjectionRequest):
         pick=over25_pick_label,
         confidence=over25_conf,
         prob=prob_over25,
-        edge_pct=edge_over25_pct,
-        note="Modelo heurístico basado en línea del book + diferencia de fuerzas.",
+        edge_pct=edge_pct,
+        note=(
+            "Probabilidad combinada (Poisson + ajuste logístico). "
+            "λ_home y λ_away estimados con prior de liga + récord de equipos."
+        ),
     )
 
-    # ============================
-    # Modelo 1X2
-    # ============================
-    probs_1x2 = _compute_1x2_probs(
-        home_comp=home_comp_raw,
-        away_comp=away_comp_raw,
-    )
-    p1 = probs_1x2["1"]
-    pX = probs_1x2["X"]
-    p2 = probs_1x2["2"]
-
-    # Mejor pick 1X2
+    # 4) 1X2 con probabilidades Poisson
+    probs_1x2 = {"1": p_home_win, "X": p_draw, "2": p_away_win}
     best_outcome = max(probs_1x2, key=probs_1x2.get)
     best_prob = probs_1x2[best_outcome]
     pick1x2_conf = _confidence_from_prob(best_prob)
@@ -447,21 +569,15 @@ async def soccer_game_projection(payload: SoccerGameProjectionRequest):
         confidence=pick1x2_conf,
         prob=best_prob,
         edge_pct=None,
-        note="Probabilidades 1X2 derivadas de rendimiento histórico (records).",
+        note="Probabilidades 1X2 derivadas de la matriz Poisson de goles.",
     )
 
-    # ============================
-    # Doble oportunidad
-    # ============================
-    p_1X = p1 + pX
-    p_X2 = pX + p2
-    p_12 = p1 + p2
+    # 5) Doble oportunidad
+    p_1X = p_home_win + p_draw
+    p_X2 = p_draw + p_away_win
+    p_12 = p_home_win + p_away_win
 
-    dc_probs = {
-        "1X": p_1X,
-        "X2": p_X2,
-        "12": p_12,
-    }
+    dc_probs = {"1X": p_1X, "X2": p_X2, "12": p_12}
     best_dc = max(dc_probs, key=dc_probs.get)
     best_dc_prob = dc_probs[best_dc]
     dc_conf = _confidence_from_prob(best_dc_prob)
@@ -472,12 +588,9 @@ async def soccer_game_projection(payload: SoccerGameProjectionRequest):
         confidence=dc_conf,
         prob=best_dc_prob,
         edge_pct=None,
-        note="Combinación de probabilidades 1X2 (doble oportunidad).",
+        note="Doble oportunidad construida a partir de las probabilidades 1X2 Poisson.",
     )
 
-    # ============================
-    # Respuesta
-    # ============================
     league_code = settings.espn_soccer_leagues.get(
         payload.league, settings.espn_soccer_default_league
     )
@@ -489,11 +602,13 @@ async def soccer_game_projection(payload: SoccerGameProjectionRequest):
         home_team=home_team_info,
         away_team=away_team_info,
         book_over_under=book_over_under,
+        lambda_home=lambda_home,
+        lambda_away=lambda_away,
         expected_goals=expected_goals,
-        prob_over25=prob_over25,
-        prob_1=p1,
-        prob_X=pX,
-        prob_2=p2,
+        prob_over25_poisson=prob_over25_poisson,
+        prob_1=p_home_win,
+        prob_X=p_draw,
+        prob_2=p_away_win,
         over25_pick=over25_pick,
         pick_1x2=pick_1x2,
         double_chance_best=double_chance_best,
